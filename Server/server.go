@@ -2,7 +2,7 @@ package server
 
 import (
 	"fmt"
-	"Redis-go/resp"
+	"Redis-go/store"
 	"net"
 )
 
@@ -16,6 +16,10 @@ func StartServer() {
 
 	fmt.Println("Redis server listening on port 7379...")
 
+	// Create ONE store — shared across ALL clients
+	// Like one whiteboard for the whole restaurant
+	s := store.NewStore()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -24,29 +28,8 @@ func StartServer() {
 		}
 
 		fmt.Println("New client connected:", conn.RemoteAddr())
-		go handleClient(conn)
-	}
-}
 
-func handleClient(conn net.Conn) {
-	defer conn.Close()
-
-	// Wrap the connection in our RESP reader
-	// Like hiring a translator who understands the Redis language
-	reader := resp.NewReader(conn)
-
-	for {
-		// Read one full command from the client
-		args, err := reader.ReadCommand()
-		if err != nil {
-			fmt.Println("Client disconnected:", conn.RemoteAddr())
-			return
-		}
-
-		// Print what command we received
-		fmt.Printf("Command received: %v\n", args)
-
-		// For now, just reply OK to everything
-		resp.WriteSimpleString(conn, "OK")
+		// Pass the store to each client handler
+		go handleClient(conn, s)
 	}
 }
