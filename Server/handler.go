@@ -5,17 +5,17 @@ import (
 	"Redis-go/resp"
 	"Redis-go/store"
 	"net"
+	"strconv"
 	"strings"
+	"time"
 )
 
-// handleClient reads commands from a client and responds
 func handleClient(conn net.Conn, s *store.Store) {
 	defer conn.Close()
 
 	reader := resp.NewReader(conn)
 
 	for {
-		// Read one full command
 		args, err := reader.ReadCommand()
 		if err != nil {
 			fmt.Println("Client disconnected:", conn.RemoteAddr())
@@ -26,14 +26,9 @@ func handleClient(conn net.Conn, s *store.Store) {
 			continue
 		}
 
-		// Convert command to uppercase so "set" and "SET" both work
-		// Like: "set".toUpperCase() in Java
 		command := strings.ToUpper(args[0])
-
 		fmt.Printf("Command: %s, Args: %v\n", command, args[1:])
 
-		// Route the command to the right handler
-		// Like a switch statement router
 		switch command {
 		case "PING":
 			handlePing(conn)
@@ -45,83 +40,135 @@ func handleClient(conn net.Conn, s *store.Store) {
 			handleDel(conn, s, args)
 		case "EXISTS":
 			handleExists(conn, s, args)
+		case "EXPIRE":
+			handleExpire(conn, s, args)
+		case "TTL":
+			handleTTL(conn, s, args)
+		case "PERSIST":
+			handlePersist(conn, s, args)
+		case "SETEX":
+			handleSetEx(conn, s, args)
 		default:
 			resp.WriteError(conn, fmt.Sprintf("unknown command '%s'", command))
 		}
 	}
 }
 
-// handlePing responds with PONG
 func handlePing(conn net.Conn) {
 	resp.WriteSimpleString(conn, "PONG")
 }
 
-// handleSet handles SET key value
 func handleSet(conn net.Conn, s *store.Store, args []string) {
-	// SET needs exactly 2 arguments: key and value
 	if len(args) < 3 {
 		resp.WriteError(conn, "SET requires 2 arguments: key and value")
 		return
 	}
-
-	key := args[1]
-	value := args[2]
-
-	s.Set(key, value)
+	s.Set(args[1], args[2])
 	resp.WriteSimpleString(conn, "OK")
 }
 
-// handleGet handles GET key
 func handleGet(conn net.Conn, s *store.Store, args []string) {
-	// GET needs exactly 1 argument: key
 	if len(args) < 2 {
 		resp.WriteError(conn, "GET requires 1 argument: key")
 		return
 	}
-
-	key := args[1]
-
-	value, ok := s.Get(key)
+	value, ok := s.Get(args[1])
 	if !ok {
-		// Key doesn't exist — return null (Redis returns nil for missing keys)
 		resp.WriteNull(conn)
 		return
 	}
-
 	resp.WriteBulkString(conn, value)
 }
 
-// handleDel handles DEL key
 func handleDel(conn net.Conn, s *store.Store, args []string) {
 	if len(args) < 2 {
 		resp.WriteError(conn, "DEL requires 1 argument: key")
 		return
 	}
-
-	key := args[1]
-	existed := s.Del(key)
-
-	if existed {
-		// Redis returns :1 if key was deleted
+	if s.Del(args[1]) {
 		conn.Write([]byte(":1\r\n"))
 	} else {
-		// Redis returns :0 if key didn't exist
 		conn.Write([]byte(":0\r\n"))
 	}
 }
 
-// handleExists handles EXISTS key
 func handleExists(conn net.Conn, s *store.Store, args []string) {
 	if len(args) < 2 {
 		resp.WriteError(conn, "EXISTS requires 1 argument: key")
 		return
 	}
-
-	key := args[1]
-
-	if s.Exists(key) {
-		conn.Write([]byte(":1\r\n")) // exists
+	if s.Exists(args[1]) {
+		conn.Write([]byte(":1\r\n"))
 	} else {
-		conn.Write([]byte(":0\r\n")) // doesn't exist
+		conn.Write([]byte(":0\r\n"))
 	}
+}
+
+// handleExpire sets expiry in seconds on a key
+func handleExpire(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 3 {
+		resp.WriteError(conn, "EXPIRE requires 2 arguments: key and seconds")
+		return
+	}
+
+	// Convert seconds string to integer
+	// Like Integer.parseInt() in Java
+	seconds, err := strconv.Atoi(args[2])
+	if err != nil {
+		resp.WriteError(conn, "seconds must be a number")
+		return
+	}
+
+	// Convert seconds to a Go duration
+	// time.Second is 1 second, multiply by how many seconds we want
+	duration := time.Duration(seconds) * time.Second
+
+	if s.Expire(args[1], duration) {
+		conn.Write([]byte(":1\r\n"))
+	} else {
+		conn.Write([]byte(":0\r\n"))
+	}
+}
+
+// handleTTL returns remaining seconds for a key
+func handleTTL(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 2 {
+		resp.WriteError(conn, "TTL requires 1 argument: key")
+		return
+	}
+
+	ttl := s.TTL(args[1])
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", ttl)))
+}
+
+// handlePersist removes expiry from a key
+func handlePersist(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 2 {
+		resp.WriteError(conn, "PERSIST requires 1 argument: key")
+		return
+	}
+
+	if s.Persist(args[1]) {
+		conn.Write([]byte(":1\r\n"))
+	} else {
+		conn.Write([]byte(":0\r\n"))
+	}
+}
+
+// handleSetEx sets a key with value AND expiry in one command
+func handleSetEx(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 4 {
+		resp.WriteError(conn, "SETEX requires 3 arguments: key, seconds, value")
+		return
+	}
+
+	seconds, err := strconv.Atoi(args[2])
+	if err != nil {
+		resp.WriteError(conn, "seconds must be a number")
+		return
+	}
+
+	duration := time.Duration(seconds) * time.Second
+	s.SetEx(args[1], args[3], duration)
+	resp.WriteSimpleString(conn, "OK")
 }
