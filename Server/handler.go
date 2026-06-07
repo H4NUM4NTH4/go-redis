@@ -1,9 +1,9 @@
 package server
 
 import (
-	"fmt"
 	"Redis-go/resp"
 	"Redis-go/store"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -48,6 +48,8 @@ func handleClient(conn net.Conn, s *store.Store) {
 			handlePersist(conn, s, args)
 		case "SETEX":
 			handleSetEx(conn, s, args)
+		case "SAVE":
+			handleSave(conn, s)
 		default:
 			resp.WriteError(conn, fmt.Sprintf("unknown command '%s'", command))
 		}
@@ -170,5 +172,14 @@ func handleSetEx(conn net.Conn, s *store.Store, args []string) {
 
 	duration := time.Duration(seconds) * time.Second
 	s.SetEx(args[1], args[3], duration)
+	resp.WriteSimpleString(conn, "OK")
+}
+
+// handleSave manually triggers a save to disk
+func handleSave(conn net.Conn, s *store.Store) {
+	if err := s.Save(); err != nil {
+		resp.WriteError(conn, "failed to save: "+err.Error())
+		return
+	}
 	resp.WriteSimpleString(conn, "OK")
 }

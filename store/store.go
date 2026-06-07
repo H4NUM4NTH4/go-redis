@@ -1,39 +1,56 @@
 package store
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"sync"
 	"time"
 )
 
 // entry holds a value and its optional expiry time
-// Like a sticky note with an optional "throw away after X" instruction
 type entry struct {
-	value     string
-	expiresAt time.Time
-	hasExpiry bool
+	Value     string    `json:"value"`
+	ExpiresAt time.Time `json:"expires_at"`
+	HasExpiry bool      `json:"has_expiry"`
 }
 
 // isExpired checks if this entry has passed its expiry time
 func (e *entry) isExpired() bool {
-	if !e.hasExpiry {
-		return false // No expiry set — lives forever
+	if !e.HasExpiry {
+		return false
 	}
-	return time.Now().After(e.expiresAt)
+	return time.Now().After(e.ExpiresAt)
 }
 
-// Store is our in-memory key-value store
+// Store is our in-memory key-value store with persistence
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]*entry
+	mu       sync.RWMutex
+	data     map[string]*entry
+	filePath string // where we save the snapshot
 }
 
-// NewStore creates a new empty store
-func NewStore() *Store {
+// NewStore creates a new store and loads data from disk if it exists
+func NewStore(filePath string) *Store {
 	s := &Store{
-		data: make(map[string]*entry),
+		data:     make(map[string]*entry),
+		filePath: filePath,
 	}
-	// Start background goroutine to clean up expired keys
+
+	// Load existing data from disk when server starts
+	// Like restoring from the last photograph
+	if err := s.load(); err != nil {
+		fmt.Println("No existing data found, starting fresh")
+	} else {
+		fmt.Printf("Loaded data from %s\n", filePath)
+	}
+
+	// Start background janitor — cleans expired keys every second
 	go s.cleanupExpiredKeys()
+
+	// Start background saver — saves snapshot every 60 seconds
+	go s.autoSave()
+
 	return s
 }
 
@@ -41,40 +58,30 @@ func NewStore() *Store {
 func (s *Store) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.data[key] = &entry{value: value}
+	s.data[key] = &entry{Value: value}
 }
 
 // SetEx stores a key-value pair with an expiry duration
-// Like: SET name John + EXPIRE name 10 in one shot
 func (s *Store) SetEx(key, value string, duration time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	s.data[key] = &entry{
-		value:     value,
-		expiresAt: time.Now().Add(duration),
-		hasExpiry: true,
+		Value:     value,
+		ExpiresAt: time.Now().Add(duration),
+		HasExpiry: true,
 	}
 }
 
-// Get retrieves a value — returns empty string and false if not found or expired
+// Get retrieves a value
 func (s *Store) Get(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	e, ok := s.data[key]
-	if !ok {
+	if !ok || e.isExpired() {
 		return "", false
 	}
-
-	// Check if the key has expired
-	// Like checking if the sticky note's time has passed
-	if e.isExpired() {
-		return "", false
-	}
-
-	return e.value, true
+	return e.Value, true
 }
 
 // Del deletes a key
@@ -89,14 +96,13 @@ func (s *Store) Del(key string) bool {
 	return ok
 }
 
-// Exists checks if a key exists and is not expired
+// Exists checks if a key exists and hasn't expired
 func (s *Store) Exists(key string) bool {
 	_, ok := s.Get(key)
 	return ok
 }
 
-// Expire sets an expiry duration on an existing key
-// Returns true if key exists, false if it doesn't
+// Expire sets expiry on an existing key
 func (s *Store) Expire(key string, duration time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,37 +111,27 @@ func (s *Store) Expire(key string, duration time.Duration) bool {
 	if !ok {
 		return false
 	}
-
-	// Update the expiry on the existing entry
-	e.expiresAt = time.Now().Add(duration)
-	e.hasExpiry = true
+	e.ExpiresAt = time.Now().Add(duration)
+	e.HasExpiry = true
 	return true
 }
 
-// TTL returns how many seconds remain before the key expires
-// Returns:
-//   -1 if key exists but has no expiry
-//   -2 if key doesn't exist or is already expired
-//    N if N seconds remain
+// TTL returns remaining seconds for a key
 func (s *Store) TTL(key string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	e, ok := s.data[key]
 	if !ok || e.isExpired() {
-		return -2 // Key doesn't exist
+		return -2
 	}
-
-	if !e.hasExpiry {
-		return -1 // Key exists but never expires
+	if !e.HasExpiry {
+		return -1
 	}
-
-	// Calculate remaining seconds
-	remaining := time.Until(e.expiresAt)
-	return int(remaining.Seconds())
+	return int(time.Until(e.ExpiresAt).Seconds())
 }
 
-// Persist removes the expiry from a key — makes it live forever
+// Persist removes expiry from a key
 func (s *Store) Persist(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -144,16 +140,68 @@ func (s *Store) Persist(key string) bool {
 	if !ok {
 		return false
 	}
-
-	e.hasExpiry = false
+	e.HasExpiry = false
 	return true
 }
 
-// cleanupExpiredKeys runs in the background every second
-// and removes keys that have expired
-// Like a janitor who walks around every second erasing old sticky notes
+// Save writes the entire store to disk as JSON
+// Like taking a photograph of the whiteboard
+func (s *Store) Save() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Convert our map to JSON bytes
+	// Like: objectMapper.writeValueAsString(map) in Java
+	bytes, err := json.Marshal(s.data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal data: %w", err)
+	}
+
+	// Write JSON bytes to file
+	// os.WriteFile creates the file if it doesn't exist
+	err = os.WriteFile(s.filePath, bytes, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	fmt.Printf("💾 Saved %d keys to %s\n", len(s.data), s.filePath)
+	return nil
+}
+
+// load reads data from disk into memory
+// Like restoring from the last photograph
+func (s *Store) load() error {
+	// Read the file from disk
+	bytes, err := os.ReadFile(s.filePath)
+	if err != nil {
+		return err // File doesn't exist yet — that's OK
+	}
+
+	// Convert JSON bytes back into our map
+	// Like: objectMapper.readValue(json, Map.class) in Java
+	var data map[string]*entry
+	if err := json.Unmarshal(bytes, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal data: %w", err)
+	}
+
+	s.data = data
+	return nil
+}
+
+// autoSave runs in the background, saving every 60 seconds
+func (s *Store) autoSave() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if err := s.Save(); err != nil {
+			fmt.Println("Auto-save failed:", err)
+		}
+	}
+}
+
+// cleanupExpiredKeys runs every second and removes expired keys
 func (s *Store) cleanupExpiredKeys() {
-	// time.NewTicker is like a clock that ticks every 1 second
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
