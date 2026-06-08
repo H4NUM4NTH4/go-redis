@@ -8,11 +8,15 @@ import (
 	"time"
 )
 
-// entry holds a value and its optional expiry time
+// entry holds any type of value with optional expiry
 type entry struct {
-	Value     string    `json:"value"`
-	ExpiresAt time.Time `json:"expires_at"`
-	HasExpiry bool      `json:"has_expiry"`
+	Value     string            `json:"value,omitempty"`
+	ListVal   []string          `json:"list_val,omitempty"`
+	SetVal    map[string]bool   `json:"set_val,omitempty"`
+	HashVal   map[string]string `json:"hash_val,omitempty"`
+	Type      string            `json:"type"` // "string", "list", "set", "hash"
+	ExpiresAt time.Time         `json:"expires_at"`
+	HasExpiry bool              `json:"has_expiry"`
 }
 
 // isExpired checks if this entry has passed its expiry time
@@ -23,68 +27,64 @@ func (e *entry) isExpired() bool {
 	return time.Now().After(e.ExpiresAt)
 }
 
-// Store is our in-memory key-value store with persistence
+// Store is our in-memory key-value store
 type Store struct {
 	mu       sync.RWMutex
 	data     map[string]*entry
-	filePath string // where we save the snapshot
+	filePath string
 }
 
-// NewStore creates a new store and loads data from disk if it exists
+// NewStore creates a new store and loads from disk
 func NewStore(filePath string) *Store {
 	s := &Store{
 		data:     make(map[string]*entry),
 		filePath: filePath,
 	}
 
-	// Load existing data from disk when server starts
-	// Like restoring from the last photograph
 	if err := s.load(); err != nil {
 		fmt.Println("No existing data found, starting fresh")
 	} else {
 		fmt.Printf("Loaded data from %s\n", filePath)
 	}
 
-	// Start background janitor — cleans expired keys every second
 	go s.cleanupExpiredKeys()
-
-	// Start background saver — saves snapshot every 60 seconds
 	go s.autoSave()
 
 	return s
 }
 
-// Set stores a key-value pair with no expiry
+// ─────────────────────────────────────────
+//  STRING COMMANDS
+// ─────────────────────────────────────────
+
 func (s *Store) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[key] = &entry{Value: value}
+	s.data[key] = &entry{Type: "string", Value: value}
 }
 
-// SetEx stores a key-value pair with an expiry duration
 func (s *Store) SetEx(key, value string, duration time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[key] = &entry{
+		Type:      "string",
 		Value:     value,
 		ExpiresAt: time.Now().Add(duration),
 		HasExpiry: true,
 	}
 }
 
-// Get retrieves a value
 func (s *Store) Get(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	e, ok := s.data[key]
-	if !ok || e.isExpired() {
+	if !ok || e.isExpired() || e.Type != "string" {
 		return "", false
 	}
 	return e.Value, true
 }
 
-// Del deletes a key
 func (s *Store) Del(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -96,13 +96,14 @@ func (s *Store) Del(key string) bool {
 	return ok
 }
 
-// Exists checks if a key exists and hasn't expired
 func (s *Store) Exists(key string) bool {
-	_, ok := s.Get(key)
-	return ok
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	return ok && !e.isExpired()
 }
 
-// Expire sets expiry on an existing key
 func (s *Store) Expire(key string, duration time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -116,7 +117,6 @@ func (s *Store) Expire(key string, duration time.Duration) bool {
 	return true
 }
 
-// TTL returns remaining seconds for a key
 func (s *Store) TTL(key string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -131,7 +131,6 @@ func (s *Store) TTL(key string) int {
 	return int(time.Until(e.ExpiresAt).Seconds())
 }
 
-// Persist removes expiry from a key
 func (s *Store) Persist(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -144,21 +143,290 @@ func (s *Store) Persist(key string) bool {
 	return true
 }
 
-// Save writes the entire store to disk as JSON
-// Like taking a photograph of the whiteboard
+// ─────────────────────────────────────────
+//  LIST COMMANDS
+// ─────────────────────────────────────────
+
+// LPush adds values to the LEFT (front) of the list
+// Like adding to the front of a queue
+func (s *Store) LPush(key string, values ...string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		// Key doesn't exist — create a new list
+		e = &entry{Type: "list", ListVal: []string{}}
+		s.data[key] = e
+	}
+
+	// Add each value to the FRONT of the slice
+	// Like cutting in line at the front
+	for _, v := range values {
+		e.ListVal = append([]string{v}, e.ListVal...)
+	}
+	return len(e.ListVal)
+}
+
+// RPush adds values to the RIGHT (back) of the list
+func (s *Store) RPush(key string, values ...string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		e = &entry{Type: "list", ListVal: []string{}}
+		s.data[key] = e
+	}
+
+	// Add each value to the BACK of the slice
+	e.ListVal = append(e.ListVal, values...)
+	return len(e.ListVal)
+}
+
+// LPop removes and returns the LEFT (front) element
+func (s *Store) LPop(key string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok || len(e.ListVal) == 0 {
+		return "", false
+	}
+
+	// Take the first element
+	val := e.ListVal[0]
+	// Remove it from the slice
+	e.ListVal = e.ListVal[1:]
+	return val, true
+}
+
+// RPop removes and returns the RIGHT (back) element
+func (s *Store) RPop(key string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok || len(e.ListVal) == 0 {
+		return "", false
+	}
+
+	// Take the last element
+	n := len(e.ListVal)
+	val := e.ListVal[n-1]
+	// Remove it from the slice
+	e.ListVal = e.ListVal[:n-1]
+	return val, true
+}
+
+// LRange returns elements from index start to stop
+// Like slicing a list — LRange key 0 -1 means "give me everything"
+func (s *Store) LRange(key string, start, stop int) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "list" {
+		return []string{}
+	}
+
+	n := len(e.ListVal)
+
+	// Handle negative indexes — "-1" means last element
+	// Like Python's list[-1]
+	if start < 0 {
+		start = n + start
+	}
+	if stop < 0 {
+		stop = n + stop
+	}
+
+	// Boundary checks
+	if start < 0 {
+		start = 0
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	if start > stop {
+		return []string{}
+	}
+
+	return e.ListVal[start : stop+1]
+}
+
+// LLen returns the length of a list
+func (s *Store) LLen(key string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "list" {
+		return 0
+	}
+	return len(e.ListVal)
+}
+
+// ─────────────────────────────────────────
+//  SET COMMANDS
+// ─────────────────────────────────────────
+
+// SAdd adds members to a set — duplicates ignored
+func (s *Store) SAdd(key string, members ...string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		e = &entry{Type: "set", SetVal: make(map[string]bool)}
+		s.data[key] = e
+	}
+
+	// Count how many NEW members we added
+	added := 0
+	for _, m := range members {
+		if !e.SetVal[m] {
+			e.SetVal[m] = true
+			added++
+		}
+	}
+	return added
+}
+
+// SRem removes members from a set
+func (s *Store) SRem(key string, members ...string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "set" {
+		return 0
+	}
+
+	removed := 0
+	for _, m := range members {
+		if e.SetVal[m] {
+			delete(e.SetVal, m)
+			removed++
+		}
+	}
+	return removed
+}
+
+// SMembers returns all members of a set
+func (s *Store) SMembers(key string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "set" {
+		return []string{}
+	}
+
+	// Convert map keys to slice
+	members := make([]string, 0, len(e.SetVal))
+	for m := range e.SetVal {
+		members = append(members, m)
+	}
+	return members
+}
+
+// SIsMember checks if a value is in the set
+func (s *Store) SIsMember(key, member string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "set" {
+		return false
+	}
+	return e.SetVal[member]
+}
+
+// ─────────────────────────────────────────
+//  HASH COMMANDS
+// ─────────────────────────────────────────
+
+// HSet sets a field in a hash
+func (s *Store) HSet(key, field, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		e = &entry{Type: "hash", HashVal: make(map[string]string)}
+		s.data[key] = e
+	}
+	e.HashVal[field] = value
+}
+
+// HGet gets a field from a hash
+func (s *Store) HGet(key, field string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "hash" {
+		return "", false
+	}
+	val, ok := e.HashVal[field]
+	return val, ok
+}
+
+// HGetAll returns all fields and values in a hash
+func (s *Store) HGetAll(key string) map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "hash" {
+		return map[string]string{}
+	}
+	return e.HashVal
+}
+
+// HDel deletes a field from a hash
+func (s *Store) HDel(key, field string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "hash" {
+		return false
+	}
+	_, ok = e.HashVal[field]
+	if ok {
+		delete(e.HashVal, field)
+	}
+	return ok
+}
+
+// HExists checks if a field exists in a hash
+func (s *Store) HExists(key, field string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "hash" {
+		return false
+	}
+	_, ok = e.HashVal[field]
+	return ok
+}
+
+// ─────────────────────────────────────────
+//  PERSISTENCE
+// ─────────────────────────────────────────
+
 func (s *Store) Save() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Convert our map to JSON bytes
-	// Like: objectMapper.writeValueAsString(map) in Java
 	bytes, err := json.Marshal(s.data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal data: %w", err)
 	}
 
-	// Write JSON bytes to file
-	// os.WriteFile creates the file if it doesn't exist
 	err = os.WriteFile(s.filePath, bytes, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
@@ -168,17 +436,12 @@ func (s *Store) Save() error {
 	return nil
 }
 
-// load reads data from disk into memory
-// Like restoring from the last photograph
 func (s *Store) load() error {
-	// Read the file from disk
 	bytes, err := os.ReadFile(s.filePath)
 	if err != nil {
-		return err // File doesn't exist yet — that's OK
+		return err
 	}
 
-	// Convert JSON bytes back into our map
-	// Like: objectMapper.readValue(json, Map.class) in Java
 	var data map[string]*entry
 	if err := json.Unmarshal(bytes, &data); err != nil {
 		return fmt.Errorf("failed to unmarshal data: %w", err)
@@ -188,11 +451,9 @@ func (s *Store) load() error {
 	return nil
 }
 
-// autoSave runs in the background, saving every 60 seconds
 func (s *Store) autoSave() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		if err := s.Save(); err != nil {
 			fmt.Println("Auto-save failed:", err)
@@ -200,11 +461,9 @@ func (s *Store) autoSave() {
 	}
 }
 
-// cleanupExpiredKeys runs every second and removes expired keys
 func (s *Store) cleanupExpiredKeys() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		s.mu.Lock()
 		for key, e := range s.data {
