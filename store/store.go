@@ -4,22 +4,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
 
-// entry holds any type of value with optional expiry
 type entry struct {
-	Value     string            `json:"value,omitempty"`
-	ListVal   []string          `json:"list_val,omitempty"`
-	SetVal    map[string]bool   `json:"set_val,omitempty"`
-	HashVal   map[string]string `json:"hash_val,omitempty"`
-	Type      string            `json:"type"` // "string", "list", "set", "hash"
-	ExpiresAt time.Time         `json:"expires_at"`
-	HasExpiry bool              `json:"has_expiry"`
+	Value     string             `json:"value,omitempty"`
+	ListVal   []string           `json:"list_val,omitempty"`
+	SetVal    map[string]bool    `json:"set_val,omitempty"`
+	HashVal   map[string]string  `json:"hash_val,omitempty"`
+	ZSetVal   map[string]float64 `json:"zset_val,omitempty"`
+	Type      string             `json:"type"`
+	ExpiresAt time.Time          `json:"expires_at"`
+	HasExpiry bool               `json:"has_expiry"`
 }
 
-// isExpired checks if this entry has passed its expiry time
 func (e *entry) isExpired() bool {
 	if !e.HasExpiry {
 		return false
@@ -27,14 +28,12 @@ func (e *entry) isExpired() bool {
 	return time.Now().After(e.ExpiresAt)
 }
 
-// Store is our in-memory key-value store
 type Store struct {
 	mu       sync.RWMutex
 	data     map[string]*entry
 	filePath string
 }
 
-// NewStore creates a new store and loads from disk
 func NewStore(filePath string) *Store {
 	s := &Store{
 		data:     make(map[string]*entry),
@@ -147,28 +146,22 @@ func (s *Store) Persist(key string) bool {
 //  LIST COMMANDS
 // ─────────────────────────────────────────
 
-// LPush adds values to the LEFT (front) of the list
-// Like adding to the front of a queue
 func (s *Store) LPush(key string, values ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e, ok := s.data[key]
 	if !ok {
-		// Key doesn't exist — create a new list
 		e = &entry{Type: "list", ListVal: []string{}}
 		s.data[key] = e
 	}
 
-	// Add each value to the FRONT of the slice
-	// Like cutting in line at the front
 	for _, v := range values {
 		e.ListVal = append([]string{v}, e.ListVal...)
 	}
 	return len(e.ListVal)
 }
 
-// RPush adds values to the RIGHT (back) of the list
 func (s *Store) RPush(key string, values ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -179,12 +172,10 @@ func (s *Store) RPush(key string, values ...string) int {
 		s.data[key] = e
 	}
 
-	// Add each value to the BACK of the slice
 	e.ListVal = append(e.ListVal, values...)
 	return len(e.ListVal)
 }
 
-// LPop removes and returns the LEFT (front) element
 func (s *Store) LPop(key string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -194,14 +185,11 @@ func (s *Store) LPop(key string) (string, bool) {
 		return "", false
 	}
 
-	// Take the first element
 	val := e.ListVal[0]
-	// Remove it from the slice
 	e.ListVal = e.ListVal[1:]
 	return val, true
 }
 
-// RPop removes and returns the RIGHT (back) element
 func (s *Store) RPop(key string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -211,16 +199,12 @@ func (s *Store) RPop(key string) (string, bool) {
 		return "", false
 	}
 
-	// Take the last element
 	n := len(e.ListVal)
 	val := e.ListVal[n-1]
-	// Remove it from the slice
 	e.ListVal = e.ListVal[:n-1]
 	return val, true
 }
 
-// LRange returns elements from index start to stop
-// Like slicing a list — LRange key 0 -1 means "give me everything"
 func (s *Store) LRange(key string, start, stop int) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -232,16 +216,12 @@ func (s *Store) LRange(key string, start, stop int) []string {
 
 	n := len(e.ListVal)
 
-	// Handle negative indexes — "-1" means last element
-	// Like Python's list[-1]
 	if start < 0 {
 		start = n + start
 	}
 	if stop < 0 {
 		stop = n + stop
 	}
-
-	// Boundary checks
 	if start < 0 {
 		start = 0
 	}
@@ -255,7 +235,6 @@ func (s *Store) LRange(key string, start, stop int) []string {
 	return e.ListVal[start : stop+1]
 }
 
-// LLen returns the length of a list
 func (s *Store) LLen(key string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -271,7 +250,6 @@ func (s *Store) LLen(key string) int {
 //  SET COMMANDS
 // ─────────────────────────────────────────
 
-// SAdd adds members to a set — duplicates ignored
 func (s *Store) SAdd(key string, members ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -282,7 +260,6 @@ func (s *Store) SAdd(key string, members ...string) int {
 		s.data[key] = e
 	}
 
-	// Count how many NEW members we added
 	added := 0
 	for _, m := range members {
 		if !e.SetVal[m] {
@@ -293,7 +270,6 @@ func (s *Store) SAdd(key string, members ...string) int {
 	return added
 }
 
-// SRem removes members from a set
 func (s *Store) SRem(key string, members ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -313,7 +289,6 @@ func (s *Store) SRem(key string, members ...string) int {
 	return removed
 }
 
-// SMembers returns all members of a set
 func (s *Store) SMembers(key string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -323,7 +298,6 @@ func (s *Store) SMembers(key string) []string {
 		return []string{}
 	}
 
-	// Convert map keys to slice
 	members := make([]string, 0, len(e.SetVal))
 	for m := range e.SetVal {
 		members = append(members, m)
@@ -331,7 +305,6 @@ func (s *Store) SMembers(key string) []string {
 	return members
 }
 
-// SIsMember checks if a value is in the set
 func (s *Store) SIsMember(key, member string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -347,7 +320,6 @@ func (s *Store) SIsMember(key, member string) bool {
 //  HASH COMMANDS
 // ─────────────────────────────────────────
 
-// HSet sets a field in a hash
 func (s *Store) HSet(key, field, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -360,7 +332,6 @@ func (s *Store) HSet(key, field, value string) {
 	e.HashVal[field] = value
 }
 
-// HGet gets a field from a hash
 func (s *Store) HGet(key, field string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -373,7 +344,6 @@ func (s *Store) HGet(key, field string) (string, bool) {
 	return val, ok
 }
 
-// HGetAll returns all fields and values in a hash
 func (s *Store) HGetAll(key string) map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -385,7 +355,6 @@ func (s *Store) HGetAll(key string) map[string]string {
 	return e.HashVal
 }
 
-// HDel deletes a field from a hash
 func (s *Store) HDel(key, field string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -401,7 +370,6 @@ func (s *Store) HDel(key, field string) bool {
 	return ok
 }
 
-// HExists checks if a field exists in a hash
 func (s *Store) HExists(key, field string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -412,6 +380,245 @@ func (s *Store) HExists(key, field string) bool {
 	}
 	_, ok = e.HashVal[field]
 	return ok
+}
+
+// ─────────────────────────────────────────
+//  SORTED SET COMMANDS
+// ─────────────────────────────────────────
+
+func (s *Store) ZAdd(key string, score float64, member string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		e = &entry{Type: "zset", ZSetVal: make(map[string]float64)}
+		s.data[key] = e
+	}
+
+	_, exists := e.ZSetVal[member]
+	e.ZSetVal[member] = score
+
+	if exists {
+		return 0
+	}
+	return 1
+}
+
+func (s *Store) ZScore(key, member string) (float64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "zset" {
+		return 0, false
+	}
+
+	score, ok := e.ZSetVal[member]
+	return score, ok
+}
+
+func (s *Store) ZRank(key, member string) (int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "zset" {
+		return 0, false
+	}
+
+	sorted := getSortedMembers(e.ZSetVal)
+
+	for i, m := range sorted {
+		if m == member {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func (s *Store) ZRange(key string, start, stop int) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "zset" {
+		return []string{}
+	}
+
+	sorted := getSortedMembers(e.ZSetVal)
+	return sliceRange(sorted, start, stop)
+}
+
+func (s *Store) ZRevRange(key string, start, stop int) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "zset" {
+		return []string{}
+	}
+
+	sorted := getSortedMembers(e.ZSetVal)
+
+	for i, j := 0, len(sorted)-1; i < j; i, j = i+1, j-1 {
+		sorted[i], sorted[j] = sorted[j], sorted[i]
+	}
+
+	return sliceRange(sorted, start, stop)
+}
+
+func (s *Store) ZRem(key, member string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok || e.Type != "zset" {
+		return false
+	}
+
+	_, exists := e.ZSetVal[member]
+	if exists {
+		delete(e.ZSetVal, member)
+	}
+	return exists
+}
+
+func getSortedMembers(zset map[string]float64) []string {
+	members := make([]string, 0, len(zset))
+	for m := range zset {
+		members = append(members, m)
+	}
+
+	sort.Slice(members, func(i, j int) bool {
+		return zset[members[i]] < zset[members[j]]
+	})
+
+	return members
+}
+
+func sliceRange(items []string, start, stop int) []string {
+	n := len(items)
+	if n == 0 {
+		return []string{}
+	}
+
+	if start < 0 {
+		start = n + start
+	}
+	if stop < 0 {
+		stop = n + stop
+	}
+	if start < 0 {
+		start = 0
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	if start > stop {
+		return []string{}
+	}
+
+	return items[start : stop+1]
+}
+
+// ─────────────────────────────────────────
+//  INCR / DECR COMMANDS
+// ─────────────────────────────────────────
+
+func (s *Store) Incr(key string) (int64, error) {
+	return s.IncrBy(key, 1)
+}
+
+func (s *Store) Decr(key string) (int64, error) {
+	return s.IncrBy(key, -1)
+}
+
+func (s *Store) IncrBy(key string, delta int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+
+	var current int64 = 0
+
+	if ok {
+		val, err := strconv.ParseInt(e.Value, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("value is not an integer")
+		}
+		current = val
+	}
+
+	current += delta
+
+	s.data[key] = &entry{
+		Type:  "string",
+		Value: strconv.FormatInt(current, 10),
+	}
+
+	return current, nil
+}
+
+// ─────────────────────────────────────────
+//  KEYS COMMAND
+// ─────────────────────────────────────────
+
+func (s *Store) Keys(pattern string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	matches := []string{}
+
+	for key, e := range s.data {
+		if e.isExpired() {
+			continue
+		}
+		if matchPattern(pattern, key) {
+			matches = append(matches, key)
+		}
+	}
+
+	return matches
+}
+
+func matchPattern(pattern, key string) bool {
+	if pattern == "*" {
+		return true
+	}
+	return globMatch(pattern, key)
+}
+
+func globMatch(pattern, str string) bool {
+	if len(pattern) == 0 && len(str) == 0 {
+		return true
+	}
+
+	if pattern == "*" {
+		return true
+	}
+
+	if len(pattern) == 0 {
+		return false
+	}
+
+	if len(str) == 0 {
+		return pattern == "*"
+	}
+
+	p := pattern[0]
+
+	if p == '*' {
+		return globMatch(pattern[1:], str) ||
+			globMatch(pattern, str[1:])
+	} else if p == '?' {
+		return globMatch(pattern[1:], str[1:])
+	} else {
+		if p != str[0] {
+			return false
+		}
+		return globMatch(pattern[1:], str[1:])
+	}
 }
 
 // ─────────────────────────────────────────

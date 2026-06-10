@@ -28,7 +28,6 @@ func handleClient(conn net.Conn, s *store.Store) {
 		fmt.Printf("Command: %s, Args: %v\n", command, args[1:])
 
 		switch command {
-		// String commands
 		case "PING":
 			handlePing(conn)
 		case "SET":
@@ -49,7 +48,6 @@ func handleClient(conn net.Conn, s *store.Store) {
 			handleSetEx(conn, s, args)
 		case "SAVE":
 			handleSave(conn, s)
-		// List commands
 		case "LPUSH":
 			handleLPush(conn, s, args)
 		case "RPUSH":
@@ -62,7 +60,6 @@ func handleClient(conn net.Conn, s *store.Store) {
 			handleLRange(conn, s, args)
 		case "LLEN":
 			handleLLen(conn, s, args)
-		// Set commands
 		case "SADD":
 			handleSAdd(conn, s, args)
 		case "SREM":
@@ -71,7 +68,6 @@ func handleClient(conn net.Conn, s *store.Store) {
 			handleSMembers(conn, s, args)
 		case "SISMEMBER":
 			handleSIsMember(conn, s, args)
-		// Hash commands
 		case "HSET":
 			handleHSet(conn, s, args)
 		case "HGET":
@@ -82,6 +78,26 @@ func handleClient(conn net.Conn, s *store.Store) {
 			handleHDel(conn, s, args)
 		case "HEXISTS":
 			handleHExists(conn, s, args)
+		case "ZADD":
+			handleZAdd(conn, s, args)
+		case "ZSCORE":
+			handleZScore(conn, s, args)
+		case "ZRANK":
+			handleZRank(conn, s, args)
+		case "ZRANGE":
+			handleZRange(conn, s, args)
+		case "ZREVRANGE":
+			handleZRevRange(conn, s, args)
+		case "ZREM":
+			handleZRem(conn, s, args)
+		case "INCR":
+			handleIncr(conn, s, args)
+		case "DECR":
+			handleDecr(conn, s, args)
+		case "INCRBY":
+			handleIncrBy(conn, s, args)
+		case "KEYS":
+			handleKeys(conn, s, args)
 		default:
 			resp.WriteError(conn, fmt.Sprintf("unknown command '%s'", command))
 		}
@@ -263,7 +279,6 @@ func handleLRange(conn net.Conn, s *store.Store, args []string) {
 		return
 	}
 	items := s.LRange(args[1], start, stop)
-	// Write as RESP array
 	conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(items))))
 	for _, item := range items {
 		resp.WriteBulkString(conn, item)
@@ -356,8 +371,6 @@ func handleHGetAll(conn net.Conn, s *store.Store, args []string) {
 		return
 	}
 	hash := s.HGetAll(args[1])
-	// HGETALL returns field1, value1, field2, value2...
-	// So array length is 2x the number of fields
 	conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(hash)*2)))
 	for field, value := range hash {
 		resp.WriteBulkString(conn, field)
@@ -386,5 +399,162 @@ func handleHExists(conn net.Conn, s *store.Store, args []string) {
 		conn.Write([]byte(":1\r\n"))
 	} else {
 		conn.Write([]byte(":0\r\n"))
+	}
+}
+
+// ─────────────────────────────────────────
+//  SORTED SET HANDLERS
+// ─────────────────────────────────────────
+
+func handleZAdd(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 4 {
+		resp.WriteError(conn, "ZADD requires key, score, member")
+		return
+	}
+	score, err := strconv.ParseFloat(args[2], 64)
+	if err != nil {
+		resp.WriteError(conn, "score must be a number")
+		return
+	}
+	added := s.ZAdd(args[1], score, args[3])
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", added)))
+}
+
+func handleZScore(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 3 {
+		resp.WriteError(conn, "ZSCORE requires key and member")
+		return
+	}
+	score, ok := s.ZScore(args[1], args[2])
+	if !ok {
+		resp.WriteNull(conn)
+		return
+	}
+	scoreStr := strconv.FormatFloat(score, 'f', -1, 64)
+	resp.WriteBulkString(conn, scoreStr)
+}
+
+func handleZRank(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 3 {
+		resp.WriteError(conn, "ZRANK requires key and member")
+		return
+	}
+	rank, ok := s.ZRank(args[1], args[2])
+	if !ok {
+		resp.WriteNull(conn)
+		return
+	}
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", rank)))
+}
+
+func handleZRange(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 4 {
+		resp.WriteError(conn, "ZRANGE requires key, start, stop")
+		return
+	}
+	start, err1 := strconv.Atoi(args[2])
+	stop, err2 := strconv.Atoi(args[3])
+	if err1 != nil || err2 != nil {
+		resp.WriteError(conn, "start and stop must be numbers")
+		return
+	}
+	members := s.ZRange(args[1], start, stop)
+	conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(members))))
+	for _, m := range members {
+		resp.WriteBulkString(conn, m)
+	}
+}
+
+func handleZRevRange(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 4 {
+		resp.WriteError(conn, "ZREVRANGE requires key, start, stop")
+		return
+	}
+	start, err1 := strconv.Atoi(args[2])
+	stop, err2 := strconv.Atoi(args[3])
+	if err1 != nil || err2 != nil {
+		resp.WriteError(conn, "start and stop must be numbers")
+		return
+	}
+	members := s.ZRevRange(args[1], start, stop)
+	conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(members))))
+	for _, m := range members {
+		resp.WriteBulkString(conn, m)
+	}
+}
+
+func handleZRem(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 3 {
+		resp.WriteError(conn, "ZREM requires key and member")
+		return
+	}
+	if s.ZRem(args[1], args[2]) {
+		conn.Write([]byte(":1\r\n"))
+	} else {
+		conn.Write([]byte(":0\r\n"))
+	}
+}
+
+// ─────────────────────────────────────────
+//  INCR / DECR HANDLERS
+// ─────────────────────────────────────────
+
+func handleIncr(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 2 {
+		resp.WriteError(conn, "INCR requires 1 argument: key")
+		return
+	}
+	val, err := s.Incr(args[1])
+	if err != nil {
+		resp.WriteError(conn, err.Error())
+		return
+	}
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", val)))
+}
+
+func handleDecr(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 2 {
+		resp.WriteError(conn, "DECR requires 1 argument: key")
+		return
+	}
+	val, err := s.Decr(args[1])
+	if err != nil {
+		resp.WriteError(conn, err.Error())
+		return
+	}
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", val)))
+}
+
+func handleIncrBy(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 3 {
+		resp.WriteError(conn, "INCRBY requires key and amount")
+		return
+	}
+	delta, err := strconv.ParseInt(args[2], 10, 64)
+	if err != nil {
+		resp.WriteError(conn, "amount must be a number")
+		return
+	}
+	val, err := s.IncrBy(args[1], delta)
+	if err != nil {
+		resp.WriteError(conn, err.Error())
+		return
+	}
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", val)))
+}
+
+// ─────────────────────────────────────────
+//  KEYS HANDLER
+// ─────────────────────────────────────────
+
+func handleKeys(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 2 {
+		resp.WriteError(conn, "KEYS requires a pattern")
+		return
+	}
+	keys := s.Keys(args[1])
+	conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(keys))))
+	for _, k := range keys {
+		resp.WriteBulkString(conn, k)
 	}
 }
