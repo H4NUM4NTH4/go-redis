@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"Redis-go/pubsub"
 	"Redis-go/resp"
 	"Redis-go/store"
 	"net"
@@ -10,9 +11,10 @@ import (
 	"time"
 )
 
-func handleClient(conn net.Conn, s *store.Store) {
+func handleClient(conn net.Conn, s *store.Store, ps *pubsub.PubSub) {
 	defer conn.Close()
 	reader := resp.NewReader(conn)
+	clientID := conn.RemoteAddr().String()
 
 	for {
 		args, err := reader.ReadCommand()
@@ -98,6 +100,13 @@ func handleClient(conn net.Conn, s *store.Store) {
 			handleIncrBy(conn, s, args)
 		case "KEYS":
 			handleKeys(conn, s, args)
+		// Pub/Sub commands
+		case "SUBSCRIBE":
+			handleSubscribe(conn, ps, args, clientID)
+		case "PUBLISH":
+			handlePublish(conn, ps, args)
+		case "UNSUBSCRIBE":
+			handleUnsubscribe(conn, ps, args, clientID)
 		default:
 			resp.WriteError(conn, fmt.Sprintf("unknown command '%s'", command))
 		}
@@ -557,4 +566,92 @@ func handleKeys(conn net.Conn, s *store.Store, args []string) {
 	for _, k := range keys {
 		resp.WriteBulkString(conn, k)
 	}
+}
+
+
+
+// ─────────────────────────────────────────
+//  PUB/SUB HANDLERS
+// ─────────────────────────────────────────
+
+// handleSubscribe subscribes a client to one or more channels
+// After subscribing, the connection ONLY listens for messages
+// Like tuning a radio — you stop talking and just listen
+func handleSubscribe(conn net.Conn, ps *pubsub.PubSub, args []string, clientID string) {
+	if len(args) < 2 {
+		resp.WriteError(conn, "SUBSCRIBE requires at least 1 channel")
+		return
+	}
+
+	channels := args[1:]
+
+	for _, channelName := range channels {
+		// Subscribe and get back a subscriber with a message channel
+		sub := ps.Subscribe(clientID, channelName)
+
+		// Tell the client they've been subscribed
+		// Redis sends a special array response for subscribe confirmation
+		// Format: ["subscribe", channelName, numberOfSubscriptions]
+		writeSubscribeResponse(conn, "subscribe", channelName, 1)
+
+		// Start a goroutine to forward messages to this client
+		// This runs in the background — whenever a message arrives
+		// on sub.Channel, it gets sent to the client connection
+		go func(ch chan string, channel string) {
+			for msg := range ch {
+				// Send message to client in Redis Pub/Sub format
+				// Format: ["message", channelName, messageContent]
+				writeMessageResponse(conn, channel, msg)
+			}
+		}(sub.Channel, channelName)
+	}
+}
+
+// handlePublish sends a message to all subscribers of a channel
+// Like a radio station broadcasting
+func handlePublish(conn net.Conn, ps *pubsub.PubSub, args []string) {
+	if len(args) < 3 {
+		resp.WriteError(conn, "PUBLISH requires channel and message")
+		return
+	}
+
+	channelName := args[1]
+	message := args[2]
+
+	// Publish and get back how many clients received it
+	count := ps.Publish(channelName, message)
+
+	// Return the number of subscribers that received the message
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", count)))
+}
+
+// handleUnsubscribe removes a client from a channel
+func handleUnsubscribe(conn net.Conn, ps *pubsub.PubSub, args []string, clientID string) {
+	if len(args) < 2 {
+		resp.WriteError(conn, "UNSUBSCRIBE requires at least 1 channel")
+		return
+	}
+
+	for _, channelName := range args[1:] {
+		ps.Unsubscribe(clientID, channelName)
+		writeSubscribeResponse(conn, "unsubscribe", channelName, 0)
+	}
+}
+
+// writeSubscribeResponse writes the subscribe/unsubscribe confirmation
+// Format Redis uses: *3\r\n $9\r\nsubscribe\r\n $4\r\nnews\r\n :1\r\n
+func writeSubscribeResponse(conn net.Conn, kind, channel string, count int) {
+	conn.Write([]byte("*3\r\n"))
+	resp.WriteBulkString(conn, kind)
+	resp.WriteBulkString(conn, channel)
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", count)))
+}
+
+// writeMessageResponse writes an incoming message to a subscriber
+// Format Redis uses: *3\r\n $7\r\nmessage\r\n $4\r\nnews\r\n $5\r\nHello\r\n
+func writeMessageResponse(conn net.Conn, channel, message string) {
+	conn.Write([]byte("*3\r\n"))
+	resp.WriteBulkString(conn, "message")
+	resp.WriteBulkString(conn, channel)
+	resp.WriteBulkString(conn, message)
 }
