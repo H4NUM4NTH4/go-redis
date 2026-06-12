@@ -11,10 +11,25 @@ import (
 	"time"
 )
 
+// Transaction holds the state for one client's transaction
+// Each client has their own — completely independent
+type Transaction struct {
+	active   bool       // true = inside MULTI block
+	commands [][]string // queued commands waiting for EXEC
+}
+
 func handleClient(conn net.Conn, s *store.Store, ps *pubsub.PubSub) {
 	defer conn.Close()
 	reader := resp.NewReader(conn)
 	clientID := conn.RemoteAddr().String()
+	defer ps.UnsubscribeAll(clientID)
+
+	// Each client starts with no active transaction
+	// Like a shopper who hasn't picked up a cart yet
+	tx := &Transaction{
+		active:   false,
+		commands: [][]string{},
+	}
 
 	for {
 		args, err := reader.ReadCommand()
@@ -29,6 +44,167 @@ func handleClient(conn net.Conn, s *store.Store, ps *pubsub.PubSub) {
 		command := strings.ToUpper(args[0])
 		fmt.Printf("Command: %s, Args: %v\n", command, args[1:])
 
+		// ─────────────────────────────────────────
+		// TRANSACTION INTERCEPT LOGIC
+		// ─────────────────────────────────────────
+		//
+		// If we're inside a MULTI block, most commands
+		// should be QUEUED, not executed immediately.
+		//
+		// Exceptions — these always execute immediately:
+		// EXEC    → execute the queue
+		// DISCARD → abandon the queue
+		// MULTI   → error (can't nest transactions)
+		if tx.active {
+			switch command {
+			case "EXEC":
+				handleExec(conn, s, ps, tx, clientID)
+			case "DISCARD":
+				handleDiscard(conn, tx)
+			case "MULTI":
+				// Nested MULTI is not allowed
+				resp.WriteError(conn, "ERR MULTI calls can not be nested")
+			default:
+				// Queue the command instead of executing it
+				tx.commands = append(tx.commands, args)
+				// Tell client it's been queued
+				conn.Write([]byte("+QUEUED\r\n"))
+			}
+			continue
+		}
+
+		// Normal execution (not in a transaction)
+		switch command {
+		case "MULTI":
+			handleMulti(conn, tx)
+		case "EXEC":
+			// EXEC without MULTI
+			resp.WriteError(conn, "ERR EXEC without MULTI")
+		case "DISCARD":
+			// DISCARD without MULTI
+			resp.WriteError(conn, "ERR DISCARD without MULTI")
+		case "PING":
+			handlePing(conn)
+		case "SET":
+			handleSet(conn, s, args)
+		case "GET":
+			handleGet(conn, s, args)
+		case "DEL":
+			handleDel(conn, s, args)
+		case "EXISTS":
+			handleExists(conn, s, args)
+		case "EXPIRE":
+			handleExpire(conn, s, args)
+		case "TTL":
+			handleTTL(conn, s, args)
+		case "PERSIST":
+			handlePersist(conn, s, args)
+		case "SETEX":
+			handleSetEx(conn, s, args)
+		case "SAVE":
+			handleSave(conn, s)
+		case "LPUSH":
+			handleLPush(conn, s, args)
+		case "RPUSH":
+			handleRPush(conn, s, args)
+		case "LPOP":
+			handleLPop(conn, s, args)
+		case "RPOP":
+			handleRPop(conn, s, args)
+		case "LRANGE":
+			handleLRange(conn, s, args)
+		case "LLEN":
+			handleLLen(conn, s, args)
+		case "SADD":
+			handleSAdd(conn, s, args)
+		case "SREM":
+			handleSRem(conn, s, args)
+		case "SMEMBERS":
+			handleSMembers(conn, s, args)
+		case "SISMEMBER":
+			handleSIsMember(conn, s, args)
+		case "HSET":
+			handleHSet(conn, s, args)
+		case "HGET":
+			handleHGet(conn, s, args)
+		case "HGETALL":
+			handleHGetAll(conn, s, args)
+		case "HDEL":
+			handleHDel(conn, s, args)
+		case "HEXISTS":
+			handleHExists(conn, s, args)
+		case "ZADD":
+			handleZAdd(conn, s, args)
+		case "ZSCORE":
+			handleZScore(conn, s, args)
+		case "ZRANK":
+			handleZRank(conn, s, args)
+		case "ZRANGE":
+			handleZRange(conn, s, args)
+		case "ZREVRANGE":
+			handleZRevRange(conn, s, args)
+		case "ZREM":
+			handleZRem(conn, s, args)
+		case "INCR":
+			handleIncr(conn, s, args)
+		case "DECR":
+			handleDecr(conn, s, args)
+		case "INCRBY":
+			handleIncrBy(conn, s, args)
+		case "KEYS":
+			handleKeys(conn, s, args)
+		case "SUBSCRIBE":
+			handleSubscribe(conn, ps, args, clientID)
+		case "PUBLISH":
+			handlePublish(conn, ps, args)
+		case "UNSUBSCRIBE":
+			handleUnsubscribe(conn, ps, args, clientID)
+		default:
+			resp.WriteError(conn, fmt.Sprintf("unknown command '%s'", command))
+		}
+	}
+}
+
+// ─────────────────────────────────────────
+//  TRANSACTION HANDLERS
+// ─────────────────────────────────────────
+
+// handleMulti starts a transaction
+// Like picking up a shopping cart
+func handleMulti(conn net.Conn, tx *Transaction) {
+	tx.active = true
+	tx.commands = [][]string{} // fresh empty queue
+	resp.WriteSimpleString(conn, "OK")
+}
+
+// handleDiscard abandons the transaction
+// Like putting the cart back without buying anything
+func handleDiscard(conn net.Conn, tx *Transaction) {
+	tx.active = false
+	tx.commands = [][]string{}
+	resp.WriteSimpleString(conn, "OK")
+}
+
+// handleExec executes all queued commands atomically
+// Like going to checkout — all items processed at once
+func handleExec(conn net.Conn, s *store.Store, ps *pubsub.PubSub, tx *Transaction, clientID string) {
+	// Mark transaction as inactive FIRST
+	tx.active = false
+
+	// Get the queued commands and clear the queue
+	commands := tx.commands
+	tx.commands = [][]string{}
+
+	// Write array header — we'll send one response per queued command
+	// Like a receipt with one line per item
+	conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(commands))))
+
+	// Execute each queued command one by one
+	for _, args := range commands {
+		command := strings.ToUpper(args[0])
+
+		// Execute the command normally
+		// Same switch as above — just executed now instead of queued
 		switch command {
 		case "PING":
 			handlePing(conn)
@@ -100,13 +276,6 @@ func handleClient(conn net.Conn, s *store.Store, ps *pubsub.PubSub) {
 			handleIncrBy(conn, s, args)
 		case "KEYS":
 			handleKeys(conn, s, args)
-		// Pub/Sub commands
-		case "SUBSCRIBE":
-			handleSubscribe(conn, ps, args, clientID)
-		case "PUBLISH":
-			handlePublish(conn, ps, args)
-		case "UNSUBSCRIBE":
-			handleUnsubscribe(conn, ps, args, clientID)
 		default:
 			resp.WriteError(conn, fmt.Sprintf("unknown command '%s'", command))
 		}
@@ -568,15 +737,10 @@ func handleKeys(conn net.Conn, s *store.Store, args []string) {
 	}
 }
 
-
-
 // ─────────────────────────────────────────
 //  PUB/SUB HANDLERS
 // ─────────────────────────────────────────
 
-// handleSubscribe subscribes a client to one or more channels
-// After subscribing, the connection ONLY listens for messages
-// Like tuning a radio — you stop talking and just listen
 func handleSubscribe(conn net.Conn, ps *pubsub.PubSub, args []string, clientID string) {
 	if len(args) < 2 {
 		resp.WriteError(conn, "SUBSCRIBE requires at least 1 channel")
@@ -584,62 +748,38 @@ func handleSubscribe(conn net.Conn, ps *pubsub.PubSub, args []string, clientID s
 	}
 
 	channels := args[1:]
-
 	for _, channelName := range channels {
-		// Subscribe and get back a subscriber with a message channel
 		sub := ps.Subscribe(clientID, channelName)
-
-		// Tell the client they've been subscribed
-		// Redis sends a special array response for subscribe confirmation
-		// Format: ["subscribe", channelName, numberOfSubscriptions]
 		writeSubscribeResponse(conn, "subscribe", channelName, 1)
 
-		// Start a goroutine to forward messages to this client
-		// This runs in the background — whenever a message arrives
-		// on sub.Channel, it gets sent to the client connection
 		go func(ch chan string, channel string) {
 			for msg := range ch {
-				// Send message to client in Redis Pub/Sub format
-				// Format: ["message", channelName, messageContent]
 				writeMessageResponse(conn, channel, msg)
 			}
 		}(sub.Channel, channelName)
 	}
 }
 
-// handlePublish sends a message to all subscribers of a channel
-// Like a radio station broadcasting
 func handlePublish(conn net.Conn, ps *pubsub.PubSub, args []string) {
 	if len(args) < 3 {
 		resp.WriteError(conn, "PUBLISH requires channel and message")
 		return
 	}
-
-	channelName := args[1]
-	message := args[2]
-
-	// Publish and get back how many clients received it
-	count := ps.Publish(channelName, message)
-
-	// Return the number of subscribers that received the message
+	count := ps.Publish(args[1], args[2])
 	conn.Write([]byte(fmt.Sprintf(":%d\r\n", count)))
 }
 
-// handleUnsubscribe removes a client from a channel
 func handleUnsubscribe(conn net.Conn, ps *pubsub.PubSub, args []string, clientID string) {
 	if len(args) < 2 {
 		resp.WriteError(conn, "UNSUBSCRIBE requires at least 1 channel")
 		return
 	}
-
 	for _, channelName := range args[1:] {
 		ps.Unsubscribe(clientID, channelName)
 		writeSubscribeResponse(conn, "unsubscribe", channelName, 0)
 	}
 }
 
-// writeSubscribeResponse writes the subscribe/unsubscribe confirmation
-// Format Redis uses: *3\r\n $9\r\nsubscribe\r\n $4\r\nnews\r\n :1\r\n
 func writeSubscribeResponse(conn net.Conn, kind, channel string, count int) {
 	conn.Write([]byte("*3\r\n"))
 	resp.WriteBulkString(conn, kind)
@@ -647,8 +787,6 @@ func writeSubscribeResponse(conn net.Conn, kind, channel string, count int) {
 	conn.Write([]byte(fmt.Sprintf(":%d\r\n", count)))
 }
 
-// writeMessageResponse writes an incoming message to a subscriber
-// Format Redis uses: *3\r\n $7\r\nmessage\r\n $4\r\nnews\r\n $5\r\nHello\r\n
 func writeMessageResponse(conn net.Conn, channel, message string) {
 	conn.Write([]byte("*3\r\n"))
 	resp.WriteBulkString(conn, "message")
