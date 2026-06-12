@@ -534,6 +534,10 @@ func (s *Store) Decr(key string) (int64, error) {
 	return s.IncrBy(key, -1)
 }
 
+func (s *Store) DecrBy(key string, delta int64) (int64, error) {
+    return s.IncrBy(key, -delta)
+}
+
 func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -1,10 +1,10 @@
 package server
 
 import (
-	"fmt"
 	"Redis-go/pubsub"
 	"Redis-go/resp"
 	"Redis-go/store"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -272,6 +272,8 @@ func handleExec(conn net.Conn, s *store.Store, ps *pubsub.PubSub, tx *Transactio
 			handleIncr(conn, s, args)
 		case "DECR":
 			handleDecr(conn, s, args)
+		case "DECRBY":
+			handleDecrBy(conn, s, args)
 		case "INCRBY":
 			handleIncrBy(conn, s, args)
 		case "KEYS":
@@ -714,6 +716,24 @@ func handleIncrBy(conn net.Conn, s *store.Store, args []string) {
 		return
 	}
 	val, err := s.IncrBy(args[1], delta)
+	if err != nil {
+		resp.WriteError(conn, err.Error())
+		return
+	}
+	conn.Write([]byte(fmt.Sprintf(":%d\r\n", val)))
+}
+
+func handleDecrBy(conn net.Conn, s *store.Store, args []string) {
+	if len(args) < 3 {
+		resp.WriteError(conn, "DECRBY requires key and amount")
+		return
+	}
+	delta, err := strconv.ParseInt(args[2], 10, 64)
+	if err != nil {
+		resp.WriteError(conn, "amount must be a number")
+		return
+	}
+	val, err := s.DecrBy(args[1], delta)
 	if err != nil {
 		resp.WriteError(conn, err.Error())
 		return
